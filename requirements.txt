@@ -1,0 +1,6 @@
+playwright==1.48.0
+yt-dlp==2024.12.6
+openai-whisper==20231117
+anthropic==0.34.2
+python-dotenv==1.0.0
+requests==2.32.3
