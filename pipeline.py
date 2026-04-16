@@ -52,16 +52,16 @@ class GetCourseVideoExtractor:
         self.captured_requests = []
 
     async def extract_video_url(self) -> Optional[str]:
-        """Extract video URL from GetCourse using Playwright"""
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
-            page = await browser.new_page()
+        """Try to extract video URL using Playwright, fallback to yt-dlp"""
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                page = await browser.new_page()
 
-            # Setup request/response listeners
-            page.on("request", self._on_request)
-            page.on("response", self._on_response)
+                # Setup request/response listeners
+                page.on("request", self._on_request)
+                page.on("response", self._on_response)
 
-            try:
                 logger.info(f"Opening GetCourse lesson: {GETCOURSE_LESSON_URL}")
                 await page.goto(GETCOURSE_LESSON_URL, wait_until="networkidle")
 
@@ -74,20 +74,18 @@ class GetCourseVideoExtractor:
                 logger.info("Waiting for video to load...")
                 start_time = time.time()
                 while not self.video_url and (time.time() - start_time) < 30:
-                    # Add random delay between actions
                     await page.wait_for_timeout(random.randint(1000, 3000))
 
                 if not self.video_url:
-                    logger.warning("Video URL not found in network requests, saving debug info...")
-                    await self._save_debug_info(page)
+                    logger.warning("Video URL not found in network requests")
 
                 await browser.close()
                 return self.video_url
 
-            except Exception as e:
-                logger.error(f"Error extracting video: {e}")
-                await browser.close()
-                return None
+        except Exception as e:
+            logger.warning(f"Playwright extraction failed: {e}")
+            logger.info("Will attempt yt-dlp direct download as fallback")
+            return None
 
     async def _login(self, page: Page) -> None:
         """Authenticate to GetCourse"""
@@ -130,17 +128,15 @@ class GetCourseVideoExtractor:
     async def _save_debug_info(self, page: Page) -> None:
         """Save debug information for troubleshooting"""
         try:
-            screenshot_path = OUTPUT_DIR / 'debug_screenshot.png'
             html_path = OUTPUT_DIR / 'debug_page.html'
-
-            await page.screenshot(path=str(screenshot_path))
             html_content = await page.content()
 
             with open(html_path, 'w', encoding='utf-8') as f:
                 f.write(html_content)
 
-            logger.info(f"Debug info saved: {screenshot_path}, {html_path}")
-            logger.info(f"Captured requests: {json.dumps(self.captured_requests[:10], indent=2)}")
+            logger.info(f"Debug HTML saved: {html_path}")
+            if self.captured_requests:
+                logger.debug(f"Captured requests: {json.dumps(self.captured_requests[:10], indent=2)}")
 
         except Exception as e:
             logger.error(f"Error saving debug info: {e}")
@@ -151,35 +147,59 @@ class VideoDownloader:
 
     @staticmethod
     def download_video(video_url: Optional[str] = None, lesson_url: str = None) -> bool:
-        """Download video using yt-dlp"""
+        """Download video using yt-dlp with multiple fallback strategies"""
         output_file = OUTPUT_DIR / 'lesson_video.mp4'
 
         try:
-            # Try with video URL first
+            # Determine URL to download
             if video_url:
                 logger.info(f"Downloading from direct URL: {video_url}")
-                url_to_download = video_url
+                urls_to_try = [video_url]
             else:
                 logger.info(f"Downloading from lesson URL: {lesson_url}")
-                url_to_download = lesson_url
+                urls_to_try = [lesson_url]
 
-            cmd = [
-                'yt-dlp',
-                '--cookies-from-browser', 'chrome',
-                '-f', 'best',
-                '-o', str(output_file),
-                url_to_download
-            ]
+            # Try multiple strategies
+            for attempt, url_to_download in enumerate(urls_to_try, 1):
+                logger.info(f"Attempt {attempt}: {url_to_download}")
 
-            logger.info(f"Running: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                # Try without authentication first
+                cmd = [
+                    'yt-dlp',
+                    '--no-warnings',
+                    '--no-check-certificate',
+                    '-f', 'best/bestvideo+bestaudio/best',
+                    '-o', str(output_file),
+                    url_to_download
+                ]
 
-            if result.returncode == 0:
-                logger.info(f"Video downloaded successfully: {output_file}")
-                return True
-            else:
-                logger.error(f"yt-dlp error: {result.stderr}")
-                return False
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+                if result.returncode == 0:
+                    logger.info(f"Video downloaded successfully: {output_file}")
+                    return True
+                else:
+                    logger.warning(f"yt-dlp attempt {attempt} failed: {result.stderr[:200]}")
+
+                # Try with Firefox cookies as alternative
+                if 'cookies' in result.stderr.lower() or 'authentication' in result.stderr.lower():
+                    logger.info("Authentication failed, trying with Firefox cookies...")
+                    cmd = [
+                        'yt-dlp',
+                        '--cookies-from-browser', 'firefox',
+                        '--no-warnings',
+                        '--no-check-certificate',
+                        '-f', 'best/bestvideo+bestaudio/best',
+                        '-o', str(output_file),
+                        url_to_download
+                    ]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+                    if result.returncode == 0:
+                        logger.info(f"Video downloaded successfully with Firefox cookies: {output_file}")
+                        return True
+
+            logger.error("All download attempts failed")
+            return False
 
         except subprocess.TimeoutExpired:
             logger.error("Video download timeout (600s)")
@@ -408,8 +428,8 @@ class Pipeline:
             logger.info("GetCourse → Transcript → Summary Pipeline Started")
             logger.info("="*60)
 
-            # Step 1: Extract video URL
-            logger.info("\n[STEP 1] Extracting video URL from GetCourse...")
+            # Step 1: Try to extract video URL with Playwright (optional)
+            logger.info("\n[STEP 1] Attempting video URL extraction...")
             extractor = GetCourseVideoExtractor()
             video_url = await extractor.extract_video_url()
 
@@ -418,11 +438,14 @@ class Pipeline:
             video_file = OUTPUT_DIR / 'lesson_video.mp4'
 
             if not VideoDownloader.download_video(video_url, GETCOURSE_LESSON_URL):
-                if not video_url:
-                    logger.error("Could not extract video URL and download failed")
-                    logger.error("For DRM-protected content, try recording system audio:")
-                    print(self._get_audio_recording_instructions())
-                    return
+                logger.error("Video download failed")
+                logger.error("For DRM-protected content, try recording system audio:")
+                print(self._get_audio_recording_instructions())
+                return
+
+            if not video_file.exists():
+                logger.error("Video file not created after download")
+                return
 
             # Step 3: Transcribe
             logger.info("\n[STEP 3] Transcribing with Whisper...")
